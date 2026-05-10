@@ -4,16 +4,8 @@ import { useSimulatorStore } from '../stores/simulator'
 import { useStorage } from '../composables/useStorage'
 
 const store = useSimulatorStore()
-const { save, load, exportPNG } = useStorage()
+const { exportPNG } = useStorage()
 const floorPlanRef = inject('floorPlanRef')
-
-function handleLoad() {
-  if (store.placedDevicesArray.length > 0) {
-    if (!confirm('¿Cargar la simulación guardada? Se sobreescribirán los datos actuales.')) return
-  }
-  load()
-  store.showToast('Simulación cargada', 'info')
-}
 
 function handleClear() {
   if (confirm('¿Borrar toda la simulación?')) {
@@ -35,12 +27,6 @@ function handleExport() {
       <span class="toolbar-badge">4.º ESO</span>
     </div>
     <div class="toolbar-right">
-      <button class="toolbar-btn" @click="save" title="Guardar simulación">
-        💾 Guardar
-      </button>
-      <button class="toolbar-btn" @click="handleLoad" title="Cargar simulación guardada">
-        📂 Cargar
-      </button>
       <button class="toolbar-btn" @click="handleExport" title="Exportar como imagen PNG">
         📷 Exportar PNG
       </button>

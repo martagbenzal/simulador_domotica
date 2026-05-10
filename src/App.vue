@@ -8,6 +8,7 @@ import FloorPlan from './components/canvas/FloorPlan.vue'
 import TemplateSelector from './components/canvas/TemplateSelector.vue'
 import InfoPanel from './components/ui/InfoPanel.vue'
 import Toast from './components/ui/Toast.vue'
+import EventLog from './components/ui/EventLog.vue'
 
 const store = useSimulatorStore()
 const { load } = useStorage()
@@ -26,6 +27,7 @@ onMounted(() => { load() })
       <TemplateSelector />
       <FloorPlan ref="floorPlanRef" />
       <InfoPanel />
+      <EventLog />
     </main>
   </div>
   <Toast />

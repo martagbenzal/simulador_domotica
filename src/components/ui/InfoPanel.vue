@@ -3,16 +3,70 @@ import { computed } from 'vue'
 import { useSimulatorStore } from '../../stores/simulator'
 import { DEVICES } from '../../data/devices'
 import { PROTOCOLS } from '../../data/protocols'
+import { useSimulation } from '../../composables/useSimulation'
 
 const store = useSimulatorStore()
+const { activateDevice } = useSimulation()
 
 // Prioridad: conexión > dispositivo > nada
-const selectedDevice = computed(() => {
+const selectedPlaced = computed(() => {
   if (!store.selectedDeviceId) return null
-  const placed = store.placedDevices.get(store.selectedDeviceId)
-  if (!placed) return null
-  return DEVICES.find(d => d.id === placed.deviceTypeId) || null
+  return store.placedDevices.get(store.selectedDeviceId) ?? null
 })
+
+const selectedDevice = computed(() => {
+  if (!selectedPlaced.value) return null
+  return DEVICES.find(d => d.id === selectedPlaced.value.deviceTypeId) || null
+})
+
+// Los dispositivos de conectividad actúan como hub de control
+const isHubDevice = computed(() => selectedDevice.value?.category === 'conectividad')
+
+// Lista de dispositivos conectados al hub seleccionado
+const connectedDevices = computed(() => {
+  if (!selectedPlaced.value || !isHubDevice.value) return []
+  const result = []
+  const hubId = selectedPlaced.value.id
+  for (const conn of store.connections.values()) {
+    if (conn.sourceId !== hubId && conn.targetId !== hubId) continue
+    const otherId = conn.sourceId === hubId ? conn.targetId : conn.sourceId
+    const otherPlaced = store.placedDevices.get(otherId)
+    const otherDevice = DEVICES.find(d => d.id === otherPlaced?.deviceTypeId)
+    if (otherDevice && otherPlaced) {
+      result.push({ conn, placedId: otherId, placed: otherPlaced, device: otherDevice })
+    }
+  }
+  return result
+})
+
+function getStateLabel(placedDevice) {
+  if (!placedDevice) return ''
+  const s = placedDevice.state ?? {}
+  if ('on' in s)        return s.on        ? '🟢 Encendido'    : '🔴 Apagado'
+  if ('recording' in s) return s.recording  ? '🔴 Grabando'     : '⚫ En reposo'
+  if ('triggered' in s) return s.triggered  ? '🟡 Detectado'    : '🟢 En reposo'
+  if ('open' in s)      return s.open       ? '🔓 Abierto'      : '🔒 Cerrado'
+  if ('locked' in s)    return s.locked     ? '🔒 Bloqueada'    : '🔓 Desbloqueada'
+  if ('alarm' in s)     return s.alarm      ? '🚨 ALARMA'       : '🟢 Normal'
+  if ('cleaning' in s)  return s.cleaning   ? '🔄 Limpiando'    : '⏸ En reposo'
+  if ('active' in s)    return s.active     ? '🟢 Activo'       : '🔴 Inactivo'
+  if ('online' in s)    return s.online     ? '🟢 En línea'     : '🔴 Desconectado'
+  return ''
+}
+
+function getActionLabel(placedDevice) {
+  if (!placedDevice) return '▶ Activar'
+  const s = placedDevice.state ?? {}
+  if ('on' in s)        return s.on        ? '⏹ Apagar'       : '▶ Encender'
+  if ('recording' in s) return s.recording  ? '⏹ Detener'      : '▶ Grabar'
+  if ('triggered' in s) return s.triggered  ? '⏹ Desactivar'   : '▶ Activar'
+  if ('open' in s)      return s.open       ? '🔒 Cerrar'       : '🔓 Abrir'
+  if ('locked' in s)    return s.locked     ? '🔓 Desbloquear'  : '🔒 Bloquear'
+  if ('alarm' in s)     return s.alarm      ? '🔕 Silenciar'    : '🔔 Activar'
+  if ('cleaning' in s)  return s.cleaning   ? '⏹ Detener'      : '▶ Limpiar'
+  if ('active' in s)    return s.active     ? '⏹ Desactivar'   : '▶ Activar'
+  return '▶ Activar'
+}
 
 const selectedConnection = computed(() => {
   if (!store.selectedConnectionId) return null
@@ -41,12 +95,55 @@ const mode = computed(() => {
       <span>Arrastra un dispositivo al plano para empezar. Selecciona un protocolo y haz clic en dos dispositivos para conectarlos.</span>
     </div>
 
-    <!-- Dispositivo seleccionado -->
+    <!-- Dispositivo seleccionado: HUB de conectividad → panel de control -->
+    <div v-else-if="mode === 'device' && isHubDevice" class="info-hub">
+      <div class="info-device-header">
+        <div class="info-device-icon" v-html="selectedDevice.icon"></div>
+        <div class="info-device-meta">
+          <div class="info-device-name">{{ selectedDevice.name }}</div>
+          <div class="info-device-state">{{ getStateLabel(selectedPlaced) }}</div>
+          <div class="info-device-desc">{{ selectedDevice.description }}</div>
+        </div>
+        <button class="info-close" @click="store.clearSelection()">✕</button>
+      </div>
+      <div class="hub-devices-section">
+        <div class="hub-devices-title">
+          Dispositivos conectados
+          <span class="hub-count">({{ connectedDevices.length }})</span>
+        </div>
+        <div v-if="connectedDevices.length === 0" class="hub-empty">
+          Sin dispositivos conectados. Haz clic en este hub y luego en otro dispositivo para conectarlos.
+        </div>
+        <div v-else class="hub-devices-list">
+          <div v-for="item in connectedDevices" :key="item.placedId" class="hub-device-row">
+            <div class="hub-device-icon" v-html="item.device.icon"></div>
+            <div class="hub-device-info">
+              <span class="hub-device-name">{{ item.device.name }}</span>
+              <span class="hub-device-state">{{ getStateLabel(item.placed) }}</span>
+            </div>
+            <div
+              class="hub-protocol-dot"
+              :style="{ background: PROTOCOLS[item.conn.protocol]?.color }"
+              :title="PROTOCOLS[item.conn.protocol]?.label"
+            ></div>
+            <button
+              class="hub-action-btn"
+              @click="activateDevice(item.placedId)"
+            >{{ getActionLabel(item.placed) }}</button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Dispositivo seleccionado: dispositivo normal → solo info educativa -->
     <div v-else-if="mode === 'device'" class="info-device">
       <div class="info-device-header">
         <div class="info-device-icon" v-html="selectedDevice.icon"></div>
         <div class="info-device-meta">
           <div class="info-device-name">{{ selectedDevice.name }}</div>
+          <div v-if="getStateLabel(selectedPlaced)" class="info-device-state">
+            {{ getStateLabel(selectedPlaced) }}
+          </div>
           <div class="info-device-desc">{{ selectedDevice.description }}</div>
           <div class="info-protocols">
             <span
@@ -279,5 +376,126 @@ const mode = computed(() => {
 .info-tag {
   font-weight: 600;
   margin-right: 4px;
+}
+
+/* Estado actual del dispositivo */
+.info-device-state {
+  font-size: 12px;
+  font-weight: 600;
+  color: #1e293b;
+  margin: 2px 0;
+}
+
+/* Panel de control del hub (dispositivos de conectividad) */
+.info-hub {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  height: 100%;
+}
+
+.hub-devices-section {
+  border-top: 1px solid #f1f5f9;
+  padding-top: 6px;
+  flex: 1;
+  overflow-y: auto;
+  min-height: 0;
+}
+
+.hub-devices-title {
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: #64748b;
+  margin-bottom: 5px;
+}
+
+.hub-count {
+  font-weight: 400;
+  color: #94a3b8;
+}
+
+.hub-empty {
+  font-size: 11px;
+  color: #94a3b8;
+  font-style: italic;
+}
+
+.hub-devices-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.hub-device-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 6px;
+  background: #f8fafc;
+  border-radius: 6px;
+  border: 1px solid #e2e8f0;
+}
+
+.hub-device-icon {
+  width: 24px;
+  height: 24px;
+  flex-shrink: 0;
+  color: #475569;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.hub-device-icon :deep(svg) {
+  width: 18px;
+  height: 18px;
+}
+
+.hub-device-info {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+
+.hub-device-name {
+  font-size: 11px;
+  font-weight: 600;
+  color: #1e293b;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.hub-device-state {
+  font-size: 10px;
+  color: #64748b;
+}
+
+.hub-protocol-dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+
+.hub-action-btn {
+  flex-shrink: 0;
+  padding: 3px 9px;
+  font-size: 10px;
+  font-weight: 600;
+  background: #1e293b;
+  color: #f1f5f9;
+  border: none;
+  border-radius: 5px;
+  cursor: pointer;
+  transition: background 0.15s;
+  white-space: nowrap;
+}
+.hub-action-btn:hover {
+  background: #0f172a;
 }
 </style>

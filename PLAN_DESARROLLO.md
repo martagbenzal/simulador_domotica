@@ -886,16 +886,711 @@ Contenido:
 
 ---
 
-## 7. Fuera del alcance (NO implementar)
+## 7. Fuera del alcance (NO implementar en la versión base)
 
-- Backend, base de datos, API REST
+- Backend con base de datos o API REST con persistencia
 - Autenticación o gestión de usuarios
-- Simulación de comportamiento en tiempo real (encender/apagar, consumo energético real)
 - Modo multi-usuario o colaborativo
 - Responsive/móvil (diseñado para uso en PC en clase)
 - Internacionalización (solo español)
 - Tests automatizados
-- CI/CD
+
+---
+
+## 10. Fase adicional — Motor de simulación y despliegue en Railway
+
+> Esta fase se implementa **después** de completar las fases 1-11. No modifica la arquitectura base, solo añade comportamiento sobre lo ya construido.
+
+### Objetivo
+
+Demostrar que las conexiones entre dispositivos son funcionales: al activar un dispositivo, el evento se propaga por sus conexiones y cambia el estado visual de los dispositivos conectados. Todo ocurre en el cliente (sin backend de datos). El servidor Express solo sirve los ficheros estáticos del build de Vite para el despliegue en Railway.
+
+---
+
+### 10.1 Estados de dispositivo — ampliar el store Pinia
+
+**Archivo:** `src/stores/simulator.js`
+
+Modificar la acción `addDevice` para que inicialice un campo `state` según el tipo de dispositivo:
+
+```js
+// Tabla de estados iniciales por deviceTypeId
+const INITIAL_STATES = {
+  bombilla:          { on: false },
+  tira_led:          { on: false },
+  lampara_pie:       { on: false },
+  camara_ip:         { recording: false },
+  sensor_movimiento: { triggered: false },
+  sensor_puerta:     { open: false },
+  cerradura:         { locked: true },
+  videoportero:      { on: false },
+  detector_humo:     { alarm: false },
+  detector_gas:      { alarm: false },
+  termostato:        { active: false, temperature: 20 },
+  sensor_temp:       { triggered: false },
+  persiana:          { open: false },
+  aire_acondicionado:{ on: false, temperature: 22 },
+  smart_tv:          { on: false },
+  altavoz:           { on: false },
+  robot_aspirador:   { cleaning: false },
+  router_wifi:       { online: true },
+  hub_zigbee:        { online: true },
+  gateway_matter:    { online: true },
+  enchufe:           { on: false },
+}
+
+function addDevice(deviceTypeId, x, y) {
+  const id = crypto.randomUUID()
+  const state = { ...(INITIAL_STATES[deviceTypeId] ?? {}) }
+  placedDevices.value.set(id, { id, deviceTypeId, x, y, state })
+  return id
+}
+```
+
+Añadir también la acción `updateDeviceState`:
+
+```js
+function updateDeviceState(id, partialState) {
+  const device = placedDevices.value.get(id)
+  if (!device) return
+  // Reemplazar el objeto completo para garantizar reactividad profunda en Pinia
+  placedDevices.value.set(id, { ...device, state: { ...device.state, ...partialState } })
+}
+```
+
+Añadir al `return` del store: `updateDeviceState`.
+
+Añadir también al store el array reactivo del log de eventos:
+
+```js
+const eventLog = ref([])   // Array de { timestamp, sourceId, targetId, protocol, description }
+
+function addLogEntry(entry) {
+  eventLog.value.unshift({ ...entry, timestamp: new Date().toLocaleTimeString('es-ES') })
+  if (eventLog.value.length > 20) eventLog.value.pop()
+}
+
+function clearLog() {
+  eventLog.value = []
+}
+```
+
+Añadir `eventLog`, `addLogEntry`, `clearLog` al `return`.
+
+---
+
+### 10.2 Motor de propagación — nuevo composable
+
+**Archivo a crear:** `src/composables/useSimulation.js`
+
+Este composable contiene la función `activateDevice(placedId)` que:
+
+1. Obtiene el dispositivo del store y hace toggle de su estado principal.
+2. Busca todas las conexiones donde ese dispositivo es `sourceId` o `targetId`.
+3. Para cada conexión, aplica la **regla de interacción** según los tipos de los dos extremos.
+4. Añade una entrada al log por cada propagación.
+
+```js
+import { useSimulatorStore } from '../stores/simulator'
+import { DEVICES } from '../data/devices'
+
+// Reglas de propagación: dado (tipoOrigen, tipoDestino, estadoOrigen) → qué estado aplicar al destino
+// Se aplican en ambas direcciones (la función comprueba los dos sentidos)
+const PROPAGATION_RULES = [
+  // Sensores → Iluminación
+  {
+    source: ['sensor_movimiento', 'sensor_puerta'],
+    target: ['bombilla', 'tira_led', 'lampara_pie'],
+    condition: (srcState) => srcState.triggered || srcState.open,
+    applyToTarget: () => ({ on: true }),
+    description: (srcName, tgtName) => `${srcName} activó ${tgtName}`
+  },
+  // Sensores → Cámara
+  {
+    source: ['sensor_movimiento', 'sensor_puerta'],
+    target: ['camara_ip'],
+    condition: (srcState) => srcState.triggered || srcState.open,
+    applyToTarget: () => ({ recording: true }),
+    description: (srcName, tgtName) => `${srcName} inició grabación en ${tgtName}`
+  },
+  // Detectores → Alarma visual (propiedad alarm)
+  {
+    source: ['detector_humo', 'detector_gas'],
+    target: ['detector_humo', 'detector_gas', 'sensor_movimiento'],
+    condition: (srcState) => srcState.alarm,
+    applyToTarget: () => ({ alarm: true }),
+    description: (srcName, tgtName) => `${srcName} propagó alarma a ${tgtName}`
+  },
+  // Termostato → Aire acondicionado
+  {
+    source: ['termostato'],
+    target: ['aire_acondicionado'],
+    condition: (srcState) => srcState.active,
+    applyToTarget: (srcState) => ({ on: true, temperature: srcState.temperature }),
+    description: (srcName, tgtName) => `${srcName} activó ${tgtName}`
+  },
+  // Enchufe → dispositivos de entretenimiento
+  {
+    source: ['enchufe'],
+    target: ['smart_tv', 'altavoz', 'robot_aspirador', 'lampara_pie', 'bombilla', 'tira_led'],
+    condition: (srcState) => srcState.on,
+    applyToTarget: () => ({ on: true }),
+    description: (srcName, tgtName) => `${srcName} encendió ${tgtName}`
+  },
+  // Gateway/Hub → todos los dispositivos conectados (sincronización)
+  {
+    source: ['gateway_matter', 'hub_zigbee', 'router_wifi'],
+    target: '*',   // cualquier tipo
+    condition: (srcState) => srcState.online,
+    applyToTarget: () => null,  // null = solo log, sin cambio de estado
+    description: (srcName, tgtName) => `${srcName} sincronizó con ${tgtName}`
+  },
+]
+
+export function useSimulation() {
+  const store = useSimulatorStore()
+
+  function getDeviceType(placedId) {
+    return store.placedDevices.get(placedId)?.deviceTypeId
+  }
+
+  function getDeviceName(placedId) {
+    const typeId = getDeviceType(placedId)
+    return DEVICES.find(d => d.id === typeId)?.name ?? 'Dispositivo'
+  }
+
+  function toggleMainState(device) {
+    const s = device.state
+    if ('on' in s)        return { on: !s.on }
+    if ('triggered' in s) return { triggered: !s.triggered }
+    if ('open' in s)      return { open: !s.open }
+    if ('locked' in s)    return { locked: !s.locked }
+    if ('alarm' in s)     return { alarm: !s.alarm }
+    if ('recording' in s) return { recording: !s.recording }
+    if ('cleaning' in s)  return { cleaning: !s.cleaning }
+    if ('active' in s)    return { active: !s.active }
+    return {}
+  }
+
+  function activateDevice(placedId) {
+    const device = store.placedDevices.get(placedId)
+    if (!device) return
+
+    // 1. Toggle estado propio
+    const newState = toggleMainState(device)
+    store.updateDeviceState(placedId, newState)
+    const updatedDevice = store.placedDevices.get(placedId)
+
+    // 2. Propagar por conexiones
+    const connections = [...store.connections.values()].filter(
+      c => c.sourceId === placedId || c.targetId === placedId
+    )
+
+    for (const conn of connections) {
+      const otherId = conn.sourceId === placedId ? conn.targetId : conn.sourceId
+      const otherDevice = store.placedDevices.get(otherId)
+      if (!otherDevice) continue
+
+      const srcTypeId = updatedDevice.deviceTypeId
+      const tgtTypeId = otherDevice.deviceTypeId
+
+      for (const rule of PROPAGATION_RULES) {
+        const srcMatch = rule.source.includes(srcTypeId)
+        const tgtMatch = rule.target === '*' || rule.target.includes(tgtTypeId)
+
+        if (srcMatch && tgtMatch && rule.condition(updatedDevice.state)) {
+          const stateToApply = rule.applyToTarget(updatedDevice.state)
+          if (stateToApply) store.updateDeviceState(otherId, stateToApply)
+
+          store.addLogEntry({
+            sourceId: placedId,
+            targetId: otherId,
+            protocol: conn.protocol,
+            description: rule.description(getDeviceName(placedId), getDeviceName(otherId))
+          })
+          break  // una regla por par de dispositivos en esta activación
+        }
+      }
+    }
+  }
+
+  return { activateDevice }
+}
+```
+
+---
+
+### 10.3 Cambios en PlacedDevice.vue — solo estados visuales reactivos
+
+**Archivo:** `src/components/canvas/PlacedDevice.vue`
+
+> **IMPORTANTE:** El clic en un dispositivo colocado en el plano **NO se modifica**. Sigue funcionando exclusivamente para la máquina de estados de conexión (comportamiento de las fases 1-11). La activación/control de dispositivos solo ocurre desde el panel del hub (sección 10.3b).
+
+**Cambios a realizar** (solo añadir indicadores visuales de estado, sin tocar el handler de clic):
+
+1. Añadir una `computed` llamada `deviceIsActive` que devuelve `true` si alguna propiedad boolean del estado es `true` (excepto `online`, que es el estado normal de hubs):
+
+```js
+const CONNECTIVITY_TYPES = ['router_wifi', 'hub_zigbee', 'gateway_matter']
+
+const deviceIsActive = computed(() => {
+  const s = props.placedDevice.state ?? {}
+  const typeId = props.placedDevice.deviceTypeId
+  // Los hubs/routers siempre están "online", no mostrar glow por ello
+  if (CONNECTIVITY_TYPES.includes(typeId)) return false
+  return Object.values(s).some(v => v === true)
+})
+
+const deviceHasAlarm = computed(() => {
+  return props.placedDevice.state?.alarm === true
+})
+```
+
+2. Añadir clases CSS condicionales al elemento raíz (mantener las clases existentes `selected` y `connection-source`):
+
+```html
+<div
+  class="placed-device"
+  :class="{
+    'device-active': deviceIsActive,
+    'device-alarm': deviceHasAlarm,
+    'device-selected': store.selectedDeviceId === props.placedDevice.id,
+    'connection-source': store.connectionSourceId === props.placedDevice.id
+  }"
+>
+```
+
+3. Añadir estilos CSS (dentro del `<style scoped>`):
+
+```css
+.device-active {
+  filter: drop-shadow(0 0 6px #fbbf24);
+}
+.device-active .device-icon {
+  color: #fbbf24;
+}
+.device-alarm {
+  filter: drop-shadow(0 0 8px #ef4444);
+  animation: alarm-pulse 0.6s ease-in-out infinite alternate;
+}
+@keyframes alarm-pulse {
+  from { filter: drop-shadow(0 0 4px #ef4444); }
+  to   { filter: drop-shadow(0 0 14px #ef4444); }
+}
+```
+
+4. El icono SVG debe estar envuelto en `<div class="device-icon">` con `color: #94a3b8` por defecto (gris apagado).
+
+---
+
+### 10.3b Nuevo componente — HubControlPanel.vue
+
+**Archivo a crear:** `src/components/ui/HubControlPanel.vue`
+
+Este componente se muestra en el `InfoPanel` **en sustitución** de la ficha educativa estándar cuando el dispositivo seleccionado es de categoría `conectividad` (router_wifi, hub_zigbee, gateway_matter, enchufe).
+
+**Lógica de funcionamiento:**
+
+El hub solo puede controlar los dispositivos que están **conectados a él en el plano** mediante una conexión ya creada. Si el alumno no hizo la conexión, el dispositivo no aparece en el panel y no puede controlarse. Este es el mecanismo educativo central: las conexiones incorrectas o ausentes impiden el control.
+
+**Props:** `hubPlacedId` (string — ID del PlacedDevice del hub seleccionado)
+
+**Computed principal — lista de dispositivos controlables:**
+
+```js
+import { computed } from 'vue'
+import { useSimulatorStore } from '../../stores/simulator'
+import { useSimulation } from '../../composables/useSimulation'
+import { DEVICES } from '../../data/devices'
+import { PROTOCOLS } from '../../data/protocols'
+
+const props = defineProps({ hubPlacedId: String })
+const store = useSimulatorStore()
+const { activateDevice, getControlLabel, getControlAction } = useSimulation()
+
+// Dispositivos conectados al hub (ambos extremos de las conexiones)
+const connectedDevices = computed(() => {
+  const result = []
+  for (const conn of store.connections.values()) {
+    let peerId = null
+    if (conn.sourceId === props.hubPlacedId) peerId = conn.targetId
+    else if (conn.targetId === props.hubPlacedId) peerId = conn.sourceId
+    if (!peerId) continue
+
+    const peer = store.placedDevices.get(peerId)
+    if (!peer) continue
+    const deviceDef = DEVICES.find(d => d.id === peer.deviceTypeId)
+    if (!deviceDef) continue
+
+    result.push({
+      placedId: peerId,
+      deviceDef,
+      state: peer.state ?? {},
+      protocol: conn.protocol,
+      connId: conn.id
+    })
+  }
+  return result
+})
+```
+
+**Template:**
+
+```html
+<template>
+  <div class="hub-control-panel">
+    <div class="hub-header">
+      <span class="hub-name">{{ hubDeviceDef.name }}</span>
+      <span class="hub-status">🟢 En línea</span>
+    </div>
+
+    <div v-if="connectedDevices.length === 0" class="hub-empty">
+      ⚠️ No hay dispositivos conectados a este hub.<br>
+      <small>Selecciona un protocolo y conecta dispositivos al hub desde el plano.</small>
+    </div>
+
+    <ul v-else class="device-list">
+      <li v-for="item in connectedDevices" :key="item.placedId" class="device-item">
+        <!-- Icono del protocolo de la conexión -->
+        <span
+          class="protocol-dot"
+          :style="{ background: PROTOCOLS[item.protocol].color }"
+          :title="PROTOCOLS[item.protocol].label"
+        />
+        <!-- Icono SVG del dispositivo -->
+        <span class="device-icon" v-html="item.deviceDef.icon" />
+        <!-- Nombre -->
+        <span class="device-name">{{ item.deviceDef.name }}</span>
+        <!-- Estado actual -->
+        <span class="device-state">{{ getStateLabel(item.state) }}</span>
+        <!-- Botón de control -->
+        <button
+          class="control-btn"
+          :class="{ 'btn-active': isMainStateTrue(item.state) }"
+          @click="activateDevice(item.placedId)"
+        >
+          {{ getControlLabel(item.deviceDef.id, item.state) }}
+        </button>
+      </li>
+    </ul>
+  </div>
+</template>
+```
+
+**Funciones auxiliares (añadir en `useSimulation.js` y exportar):**
+
+```js
+// Devuelve la etiqueta del botón de control según el tipo y estado
+function getControlLabel(deviceTypeId, state) {
+  if ('on' in state)        return state.on        ? 'Apagar'    : 'Encender'
+  if ('recording' in state) return state.recording  ? 'Detener'   : 'Grabar'
+  if ('triggered' in state) return state.triggered  ? 'Resetear'  : 'Simular'
+  if ('open' in state)      return state.open       ? 'Cerrar'    : 'Abrir'
+  if ('locked' in state)    return state.locked     ? 'Abrir'     : 'Cerrar'
+  if ('alarm' in state)     return state.alarm      ? 'Silenciar' : 'Probar'
+  if ('cleaning' in state)  return state.cleaning   ? 'Detener'   : 'Limpiar'
+  if ('active' in state)    return state.active     ? 'Desactivar': 'Activar'
+  return 'Activar'
+}
+
+function isMainStateTrue(state) {
+  return Object.values(state).some(v => v === true)
+}
+```
+
+**Estilos clave del componente:**
+
+```css
+.hub-control-panel { padding: 8px; }
+.hub-header { display: flex; justify-content: space-between; font-weight: 600; margin-bottom: 8px; }
+.hub-empty { color: #94a3b8; font-size: 13px; padding: 8px; }
+.device-list { list-style: none; display: flex; flex-direction: column; gap: 6px; max-height: 120px; overflow-y: auto; }
+.device-item { display: flex; align-items: center; gap: 8px; padding: 4px 6px; background: #1e293b; border-radius: 4px; }
+.protocol-dot { width: 10px; height: 10px; border-radius: 50%; flex-shrink: 0; }
+.device-icon { width: 20px; height: 20px; color: #94a3b8; flex-shrink: 0; }
+.device-name { flex: 1; font-size: 12px; color: #e2e8f0; }
+.device-state { font-size: 11px; color: #94a3b8; min-width: 80px; text-align: right; }
+.control-btn { padding: 2px 10px; border-radius: 4px; border: 1px solid #475569; background: #334155; color: #f1f5f9; font-size: 11px; cursor: pointer; transition: background 0.15s; }
+.control-btn:hover { background: #475569; }
+.control-btn.btn-active { background: #16a34a; border-color: #16a34a; }
+```
+
+---
+
+### 10.4 Animación de señal en las líneas — ConnectionLine.vue
+
+**Archivo:** `src/components/canvas/ConnectionLine.vue`
+
+Añadir una animación de punto viajando por la línea cuando hay una propagación activa. La forma más sencilla es con SVG `<circle>` animado con `animateMotion`:
+
+```html
+<!-- Dentro del <svg> o <g> del componente, después de las <line> existentes -->
+<circle
+  v-if="isSignaling"
+  r="5"
+  :fill="protocolColor"
+  opacity="0.9"
+>
+  <animateMotion
+    :dur="animationDuration"
+    repeatCount="3"
+    fill="freeze"
+    @endEvent="isSignaling = false"
+  >
+    <mpath :href="`#line-path-${connection.id}`"/>
+  </animateMotion>
+</circle>
+
+<!-- La línea como <path> con id para que mpath pueda referenciarla -->
+<path
+  :id="`line-path-${connection.id}`"
+  :d="`M${x1},${y1} L${x2},${y2}`"
+  :stroke="protocolColor"
+  :stroke-width="isSelected ? 4 : 2.5"
+  :stroke-dasharray="protocolDash"
+  stroke-linecap="round"
+  fill="none"
+/>
+```
+
+Para que la animación se dispare, el store debe exponer un evento. La forma más simple: añadir un `Set` reactivo en el store llamado `signalingConnections` que contiene los IDs de conexiones que están animando. El composable `useSimulation` añade el ID de la conexión al Set al propagar, y lo elimina tras 1.5s. `ConnectionLine` observa si su `connection.id` está en ese Set para activar `isSignaling`.
+
+En el store añadir:
+
+```js
+const signalingConnections = ref(new Set())
+
+function signalConnection(connId) {
+  signalingConnections.value = new Set([...signalingConnections.value, connId])
+  setTimeout(() => {
+    const next = new Set(signalingConnections.value)
+    next.delete(connId)
+    signalingConnections.value = next
+  }, 1500)
+}
+```
+
+En `useSimulation.js`, tras `store.addLogEntry(...)`, añadir `store.signalConnection(conn.id)`.
+
+En `ConnectionLine.vue`:
+
+```js
+const isSignaling = computed(() => store.signalingConnections.has(props.connection.id))
+const animationDuration = computed(() => {
+  // WiFi más rápido, Bluetooth más lento
+  const speeds = { wifi: '0.4s', matter: '0.5s', zigbee: '0.6s', bluetooth: '0.8s' }
+  return speeds[props.connection.protocol] ?? '0.5s'
+})
+```
+
+---
+
+### 10.5 Log de eventos — nuevo componente
+
+**Archivo a crear:** `src/components/ui/EventLog.vue`
+
+Panel colapsable que se muestra **a la derecha del InfoPanel** o debajo de él. Altura máxima 180px con scroll interno.
+
+Estructura visual:
+
+```
+┌─ Log de eventos ────────────────────────────── [Limpiar] [▲/▼] ┐
+│ 12:34:05  💡 Bombilla ←(Zigbee)── 🔍 Sensor movimiento  ENCENDIDA │
+│ 12:33:51  📷 Cámara   ←(WiFi)──── 🔍 Sensor movimiento  GRABANDO  │
+│ 12:33:40  🌡️ A/C      ←(WiFi)──── 🌡️ Termostato         ACTIVADO  │
+└───────────────────────────────────────────────────────────────────┘
+```
+
+Comportamiento:
+- Leer `store.eventLog` (array reactivo).
+- Cada entrada muestra: timestamp + nombre dispositivo origen + protocolo (con color) + nombre dispositivo destino + descripción.
+- Botón "Limpiar" llama a `store.clearLog()`.
+- Botón ▲/▼ colapsa/expande el panel (estado local con `ref(true)`).
+- Si no hay entradas: mostrar texto "Haz clic en un dispositivo para simular su activación."
+- Animación de entrada para cada nueva línea: `<TransitionGroup name="log-entry">`.
+- CSS de la animación:
+
+```css
+.log-entry-enter-active { transition: all 0.3s ease; }
+.log-entry-enter-from   { opacity: 0; transform: translateX(-10px); }
+```
+
+**Integración:** Añadir `<EventLog />` en `src/App.vue` dentro de `.canvas-area`, después de `<InfoPanel />`.
+
+---
+
+### 10.6 Actualizar InfoPanel.vue — panel de control para hubs y ficha de estado para el resto
+
+**Archivo:** `src/components/ui/InfoPanel.vue`
+
+El InfoPanel ahora tiene **dos modos** según el tipo de dispositivo seleccionado:
+
+**Modo A — Dispositivo de conectividad** (`router_wifi`, `hub_zigbee`, `gateway_matter`, `enchufe`):
+
+Mostrar el componente `HubControlPanel` en lugar de la ficha educativa estándar:
+
+```html
+<!-- En el bloque v-else-if del dispositivo seleccionado -->
+<template v-if="isConnectivityDevice">
+  <HubControlPanel :hub-placed-id="store.selectedDeviceId" />
+</template>
+<template v-else>
+  <!-- ficha educativa estándar con descripción, protocolos, consumo, etc. -->
+  <!-- igual que en la versión original de las fases 1-11 -->
+  <!-- añadir solo la línea de estado actual (solo lectura) -->
+  <div class="device-state-row">
+    <span class="state-label">Estado: </span>
+    <span class="state-value">{{ getStateLabel(selectedPlacedDevice.state) }}</span>
+    <small class="state-hint">(contrólalo conectándolo a un hub)</small>
+  </div>
+</template>
+```
+
+Computed para detectar si es un dispositivo de conectividad:
+
+```js
+import HubControlPanel from './HubControlPanel.vue'
+
+const CONNECTIVITY_TYPES = ['router_wifi', 'hub_zigbee', 'gateway_matter', 'enchufe']
+
+const isConnectivityDevice = computed(() => {
+  if (!store.selectedDeviceId) return false
+  const placed = store.placedDevices.get(store.selectedDeviceId)
+  return placed ? CONNECTIVITY_TYPES.includes(placed.deviceTypeId) : false
+})
+```
+
+**Función `getStateLabel`** (solo lectura, para dispositivos no-hub):
+
+```js
+function getStateLabel(state = {}) {
+  if ('on' in state)        return state.on        ? '🟢 Encendido'  : '🔴 Apagado'
+  if ('recording' in state) return state.recording  ? '🔴 Grabando'   : '⚫ En reposo'
+  if ('triggered' in state) return state.triggered  ? '🟡 Detectado'  : '🟢 En reposo'
+  if ('open' in state)      return state.open       ? '🔓 Abierto'    : '🔒 Cerrado'
+  if ('locked' in state)    return state.locked     ? '🔒 Bloqueada'  : '🔓 Desbloqueada'
+  if ('alarm' in state)     return state.alarm      ? '🚨 ALARMA'     : '🟢 Normal'
+  if ('cleaning' in state)  return state.cleaning   ? '🔄 Limpiando'  : '⏸ En reposo'
+  if ('active' in state)    return state.active     ? '🟢 Activo'     : '🔴 Inactivo'
+  return ''
+}
+```
+
+**Modo B — Conexión seleccionada:** sin cambios respecto a las fases 1-11.
+
+**Modo C — Nada seleccionado:** sin cambios respecto a las fases 1-11.
+
+---
+
+### 10.7 Servidor Express para Railway
+
+**Archivo a crear:** `server.js` (en la raíz del proyecto)
+
+```js
+import express from 'express'
+import { fileURLToPath } from 'url'
+import { dirname, join } from 'path'
+
+const __dirname = dirname(fileURLToPath(import.meta.url))
+const app = express()
+const PORT = process.env.PORT || 3000
+
+app.use(express.static(join(__dirname, 'dist')))
+
+// SPA fallback: cualquier ruta no encontrada devuelve index.html
+app.get('*', (_req, res) => {
+  res.sendFile(join(__dirname, 'dist', 'index.html'))
+})
+
+app.listen(PORT, () => {
+  console.log(`Simulador Domótica ejecutándose en http://localhost:${PORT}`)
+})
+```
+
+**Modificaciones en `package.json`:**
+
+1. Añadir `express` como dependencia de producción: `npm install express`
+2. Añadir el script `start`:
+
+```json
+{
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview",
+    "start": "node server.js"
+  }
+}
+```
+
+> El campo `"type": "module"` ya está en el `package.json` del proyecto, lo que permite usar `import` en `server.js` directamente.
+
+---
+
+### 10.8 Configuración de Railway
+
+Railway detecta automáticamente un proyecto Node.js con `package.json`. Los pasos de configuración son:
+
+1. Hacer push del proyecto a GitHub (incluyendo `server.js` y el `package.json` actualizado).
+2. Desde la consola de Railway: **New Project → Deploy from GitHub repo** → seleccionar el repositorio.
+3. Railway ejecutará automáticamente `npm install` y luego `npm run build` + `npm start` si se configura el **Build Command** y el **Start Command**:
+   - Build Command: `npm run build`
+   - Start Command: `npm start`
+4. Railway expone la variable de entorno `PORT` automáticamente; el `server.js` ya la lee.
+5. La URL pública estará disponible en el dashboard de Railway (formato `https://nombre-proyecto.up.railway.app`).
+
+> **Nota:** El fichero `dist/` NO debe estar en `.gitignore` durante el despliegue, o bien Railway debe ejecutar el build. La opción más limpia es que Railway ejecute el build command (`npm run build`) antes de iniciar el servidor, lo que genera `dist/` en el servidor. Verificar que `.gitignore` tiene `dist/` excluido (comportamiento por defecto de Vite) y que el Build Command está configurado en Railway.
+
+---
+
+### 10.9 Resumen de archivos modificados/creados en esta fase
+
+| Archivo | Tipo | Cambio |
+|---|---|---|
+| `src/stores/simulator.js` | Modificar | Añadir `INITIAL_STATES`, campo `state` en `addDevice`, acción `updateDeviceState`, `eventLog`, `addLogEntry`, `clearLog`, `signalingConnections`, `signalConnection` |
+| `src/composables/useSimulation.js` | **Crear** | Motor de propagación con `PROPAGATION_RULES`, `activateDevice`, `getControlLabel`, `isMainStateTrue` |
+| `src/components/canvas/PlacedDevice.vue` | Modificar | Añadir `deviceIsActive` / `deviceHasAlarm` computeds y clases CSS de glow/alarma. **El handler de clic NO se modifica.** |
+| `src/components/canvas/ConnectionLine.vue` | Modificar | Añadir `<circle>` con `<animateMotion>`, `isSignaling` computed, `animationDuration` por protocolo |
+| `src/components/ui/HubControlPanel.vue` | **Crear** | Lista de dispositivos conectados al hub con botones de control por dispositivo |
+| `src/components/ui/EventLog.vue` | **Crear** | Panel de log con `TransitionGroup`, botones limpiar/colapsar |
+| `src/components/ui/InfoPanel.vue` | Modificar | Mostrar `HubControlPanel` para dispositivos de conectividad; estado de solo lectura (`getStateLabel`) para el resto |
+| `src/App.vue` | Modificar | Añadir `<EventLog />` |
+| `server.js` | **Crear** | Express estático, fallback SPA, lectura de `process.env.PORT` |
+| `package.json` | Modificar | Añadir `express` a dependencies, añadir script `"start": "node server.js"` |
+
+---
+
+### 10.10 Checklist de verificación de esta fase
+
+**Verificación de que el clic en dispositivos sigue funcionando para conexiones:**
+- [ ] Clic en un dispositivo (no hub) con `connectionState === 'idle'` → el dispositivo queda seleccionado y aparece en InfoPanel (NO se activa)
+- [ ] Clic en dispositivo A → clic en dispositivo B → se crea la conexión (flujo de fases 1-11 intacto)
+- [ ] Clic en el mismo dispositivo durante conexión → cancela la operación
+
+**Verificación del HubControlPanel:**
+- [ ] Clic en un Router WiFi sin conexiones → InfoPanel muestra HubControlPanel con mensaje "No hay dispositivos conectados"
+- [ ] Con Router WiFi conectado a Cámara IP (WiFi) → HubControlPanel lista la Cámara con botón "Grabar"
+- [ ] Pulsar "Grabar" → Cámara muestra glow, log registra el evento, línea anima señal
+- [ ] Con Hub Zigbee conectado a Bombilla (Zigbee) → botón "Encender" → bombilla muestra glow amarillo
+- [ ] Un dispositivo sin conexión al hub NO aparece en el HubControlPanel aunque esté en el plano
+- [ ] Conectar un Sensor de movimiento (Zigbee) al Hub Zigbee → al pulsar "Simular" en el hub, el sensor activa y propaga a bombillas conectadas al mismo hub
+
+**Verificación de estados visuales:**
+- [ ] Dispositivo activo (on=true) muestra glow amarillo en el plano
+- [ ] Detector de humo con alarm=true muestra animación de pulso rojo
+- [ ] InfoPanel de dispositivo no-hub muestra estado actual en modo solo lectura con hint "contrólalo conectándolo a un hub"
+- [ ] Hubs/routers/gateways NO muestran glow aunque estén online
+
+**Verificación de animación y log:**
+- [ ] La línea de conexión anima un punto viajando al propagarse una señal
+- [ ] El punto viaja más rápido en conexiones WiFi que en Bluetooth
+- [ ] El EventLog muestra entradas con timestamp, nombres de dispositivos y protocolo usado
+- [ ] Botón "Limpiar" del EventLog vacía el historial
+
+**Verificación de despliegue:**
+- [ ] `npm run build` completa sin errores
+- [ ] `npm start` sirve la app en `localhost:3000`
+- [ ] En Railway, la URL pública carga la aplicación correctamente
 
 ---
 

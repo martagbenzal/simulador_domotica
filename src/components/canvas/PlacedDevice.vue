@@ -22,6 +22,11 @@ const isConnectionSource = computed(() =>
   store.connectionState === 'selecting_target' &&
   store.connectionSourceId === props.placedDevice.id
 )
+const deviceIsActive = computed(() => {
+  const s = props.placedDevice.state ?? {}
+  return Object.values(s).some(v => v === true)
+})
+const deviceIsAlarm = computed(() => !!props.placedDevice.state?.alarm)
 
 const showDelete = ref(false)
 
@@ -81,7 +86,7 @@ function onClick(event) {
   if (event.target.closest('.delete-btn')) return
 
   if (store.connectionState === 'idle') {
-    startConnection(props.placedDevice.id)
+    startConnection(props.placedDevice.id)  // selecciona el dispositivo y entra en modo conexión
   } else if (store.connectionState === 'selecting_target') {
     handleTargetClick(props.placedDevice.id)
   }
@@ -99,7 +104,9 @@ function onDelete(event) {
     class="placed-device"
     :class="{
       'placed-device--selected': isSelected,
-      'placed-device--source': isConnectionSource
+      'placed-device--source': isConnectionSource,
+      'device-active': deviceIsActive && !deviceIsAlarm,
+      'device-alarm': deviceIsAlarm
     }"
     :style="{
       left: (placedDevice.x - 22) + 'px',
@@ -117,7 +124,7 @@ function onDelete(event) {
       title="Eliminar dispositivo"
       @click="onDelete"
     >✕</button>
-    <div class="device-icon" v-html="deviceType.icon"></div>
+    <div class="device-icon" :class="{ 'device-icon--active': deviceIsActive && !deviceIsAlarm, 'device-icon--alarm': deviceIsAlarm }" v-html="deviceType.icon"></div>
     <span class="device-label">{{ deviceType.name }}</span>
   </div>
 </template>
@@ -204,5 +211,24 @@ function onDelete(event) {
   z-index: 20;
   line-height: 1;
   padding: 0;
+}
+
+/* Estados de simulación (Fase 10) */
+.device-active {
+  filter: drop-shadow(0 0 6px #fbbf24);
+}
+.device-alarm {
+  filter: drop-shadow(0 0 8px #ef4444);
+  animation: alarm-pulse 0.6s ease-in-out infinite alternate;
+}
+@keyframes alarm-pulse {
+  from { filter: drop-shadow(0 0 4px #ef4444); }
+  to   { filter: drop-shadow(0 0 14px #ef4444); }
+}
+.device-icon--active {
+  color: #fbbf24;
+}
+.device-icon--alarm {
+  color: #ef4444;
 }
 </style>
